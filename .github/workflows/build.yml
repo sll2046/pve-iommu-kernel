@@ -1,0 +1,272 @@
+name: Build PVE Kernel with IOMMU ACS Override
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'README.md'
+      - 'LICENSE'
+      - '.gitignore'
+  schedule:
+    # 每周日 UTC 02:00 = 北京时间 10:00 自动构建
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      pve_branch:
+        description: 'PVE 内核分支'
+        required: false
+        default: 'master'
+        type: choice
+        options:
+          - master
+          - stable-8.3
+          - stable-8.2
+          - stable-8.1
+      kernel_suffix:
+        description: '内核版本自定义后缀（如 -iommu）'
+        required: false
+        default: '-iommu'
+      apply_acs:
+        description: '应用 ACS Override 补丁（强制拆分 IOMMU 分组）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  build:
+    name: Build PVE Kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 480  # 最长 8 小时
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare build parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ github.event.inputs.pve_branch }}"
+            SUFFIX="${{ github.event.inputs.kernel_suffix }}"
+            ACS="${{ github.event.inputs.apply_acs }}"
+          else
+            BRANCH="master"
+            SUFFIX="-iommu"
+            ACS="true"
+          fi
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
+          echo "acs=$ACS" >> $GITHUB_OUTPUT
+          echo ""
+          echo "=== 构建参数 ==="
+          echo "PVE 分支: $BRANCH"
+          echo "内核后缀: $SUFFIX"
+          echo "ACS 补丁: $ACS"
+          echo ""
+
+      - name: Build kernel in Docker (Debian Bookworm matching PVE 8.x)
+        run: |
+          # 创建输出目录
+          mkdir -p output
+
+          # 构建 Docker 镜像并运行编译
+          docker build -t pve-kernel-builder -f Dockerfile .
+
+          # 运行编译容器
+          docker run --rm \
+            -v "${{ github.workspace }}/scripts:/build/scripts:ro" \
+            -v "${{ github.workspace }}/output:/output" \
+            -e PVE_BRANCH="${{ steps.params.outputs.branch }}" \
+            -e KERNEL_SUFFIX="${{ steps.params.outputs.suffix }}" \
+            -e APPLY_ACS="${{ steps.params.outputs.acs }}" \
+            -e BUILD_CORES=$(nproc) \
+            pve-kernel-builder
+
+          echo ""
+          echo "=== 编译产物 ==="
+          ls -lh output/
+
+      - name: Generate install instructions & helper scripts
+        run: |
+          # 安装说明
+          cat > output/INSTALL.md << 'EOF'
+          # PVE IOMMU 内核安装指南
+
+          ## ⚠️ 风险提示
+          **更换内核有风险！** 建议在测试环境先验证再上生产环境。
+          请确保你有物理访问或 IPMI/iDRAC/控制台访问权限，万一新内核无法启动可以在 GRUB 中选择旧内核回退。
+
+          ## 一、安装内核
+          将本目录下所有 `.deb` 文件上传到 PVE 宿主机，然后执行：
+
+          ```bash
+          # 安装内核
+          dpkg -i pve-kernel-*.deb pve-headers-*.deb 2>/dev/null
+          # 如果有 libpve-*-headers 包也一起装
+          dpkg -i *.deb 2>/dev/null
+          apt-get install -f -y
+          ```
+
+          ## 二、开启 IOMMU（GRUB 配置）
+
+          编辑 GRUB 配置文件：
+          ```bash
+          nano /etc/default/grub
+          ```
+
+          ### Intel CPU 平台
+          将 `GRUB_CMDLINE_LINUX_DEFAULT` 修改为：
+          ```
+          GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt pcie_acs_override=downstream,multifunction video=efifb:off"
+          ```
+
+          ### AMD CPU 平台
+          将 `GRUB_CMDLINE_LINUX_DEFAULT` 修改为：
+          ```
+          GRUB_CMDLINE_LINUX_DEFAULT="quiet amd_iommu=on iommu=pt pcie_acs_override=downstream,multifunction video=efifb:off"
+          ```
+
+          > 如果用了 `downstream,multifunction` 后某些设备仍未拆分，
+          > 可尝试更激进的参数：`pcie_acs_override=all`（会强制所有 PCIe 设备独立分组，但有安全风险）
+
+          更新 GRUB 并重启：
+          ```bash
+          update-grub
+          reboot
+          ```
+
+          ## 三、加载 VFIO 模块（直通必备）
+
+          ```bash
+          # 添加模块到开机加载
+          cat >> /etc/modules << VFIOEOF
+          vfio
+          vfio_iommu_type1
+          vfio_pci
+          vfio_virqfd
+          VFIOEOF
+
+          # 允许不安全的中断重映射（某些老主板需要）
+          echo "options vfio_iommu_type1 allow_unsafe_interrupts=1" > /etc/modprobe.d/vfio.conf
+
+          # 更新 initramfs
+          update-initramfs -u -k all
+          reboot
+          ```
+
+          ## 四、验证 IOMMU 是否生效
+
+          ```bash
+          # 1. 检查内核版本
+          uname -r
+
+          # 2. 确认 IOMMU 已启用
+          dmesg | grep -e DMAR -e IOMMU
+          # 应该看到 "DMAR: IOMMU enabled" 或 "AMD-Vi: AMD-Vi enabled"
+
+          # 3. 查看 IOMMU 分组
+          bash check-iommu-groups.sh
+          ```
+
+          ## 五、黑名单冲突驱动（GPU 直通需要）
+
+          ### NVIDIA 显卡
+          ```bash
+          cat >> /etc/modprobe.d/blacklist.conf << EOF
+          blacklist nouveau
+          blacklist nvidia
+          blacklist nvidiafb
+          blacklist nvidia_drm
+          blacklist snd_hda_intel
+          EOF
+          update-initramfs -u -k all
+          ```
+
+          ### AMD 显卡
+          ```bash
+          cat >> /etc/modprobe.d/blacklist.conf << EOF
+          blacklist radeon
+          blacklist amdgpu
+          EOF
+          update-initramfs -u -k all
+          ```
+
+          ## 六、回滚方法
+
+          如果新内核无法启动或不稳定：
+          1. 重启时在 GRUB 菜单选择 `Advanced options for Proxmox VE`
+          2. 选择旧的官方内核启动
+          3. 卸载新内核：
+             ```bash
+             dpkg -l | grep pve-kernel | grep iommu
+             apt remove pve-kernel-<版本号>-iommu-*
+             update-grub
+             reboot
+             ```
+          EOF
+
+          # IOMMU 分组检查脚本
+          cat > output/check-iommu-groups.sh << 'EOF'
+          #!/bin/bash
+          # IOMMU 分组查看脚本
+          # 用法: bash check-iommu-groups.sh
+          shopt -s nullglob
+          echo "=== IOMMU Groups ==="
+          echo ""
+          for g in $(ls -d /sys/kernel/iommu_groups/* | sort -V); do
+              echo "IOMMU Group $(basename "$g"):"
+              for d in "$g"/devices/*; do
+                  echo -e "  $(lspci -nns "${d##*/}")"
+              done
+              echo ""
+          done
+          EOF
+          chmod +x output/check-iommu-groups.sh
+
+          echo "=== 生成的文件 ==="
+          ls -lh output/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pve-kernel-iommu-${{ steps.params.outputs.branch }}
+          path: output/
+          retention-days: 90
+          compression-level: 6
+
+      - name: Create Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: output/*
+          generate_release_notes: true
+          body: |
+            ## PVE Kernel with IOMMU ACS Override
+
+            自动编译的 PVE 内核，内置 ACS Override 补丁增强版，解决 IOMMU 分组不独立问题（常见于 J3455/N3150/J4125/N5105 等主板）。
+
+            ### 使用方法
+            1. 下载附件中的所有 .deb 文件
+            2. 上传到 PVE 宿主机并 `dpkg -i *.deb`
+            3. 按 INSTALL.md 配置 GRUB 参数
+            4. 重启验证
+
+      - name: Print build summary
+        run: |
+          DEB_COUNT=$(ls output/*.deb 2>/dev/null | wc -l)
+          echo "## 构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "- PVE 分支: ${{ steps.params.outputs.branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 内核后缀: ${{ steps.params.outputs.suffix }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ACS 补丁: ${{ steps.params.outputs.acs }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 生成 deb 包数量: $DEB_COUNT" >> $GITHUB_STEP_SUMMARY
+          if [ "$DEB_COUNT" -gt 0 ]; then
+            echo "- 产物下载: Artifacts 中下载" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ⚠️ 未生成 deb 包，请查看构建日志" >> $GITHUB_STEP_SUMMARY
+          fi

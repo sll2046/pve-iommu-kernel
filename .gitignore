@@ -1,0 +1,30 @@
+# Build artifacts
+*.deb
+*.ddeb
+*.udeb
+*.changes
+*.buildinfo
+*.dsc
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.orig.tar.*
+output/
+pve-kernel-src/
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
